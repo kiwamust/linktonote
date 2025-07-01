@@ -6,13 +6,9 @@ import os
 import re
 import zipfile
 from io import BytesIO
-from markdownify import markdownify as md
-import asyncio
-import aiohttp
 from datetime import datetime
-from urllib.parse import urlparse, urljoin
+from urllib.parse import urlparse
 import time
-from config import Config
 
 # Streamlitの設定
 st.set_page_config(
@@ -20,6 +16,15 @@ st.set_page_config(
     page_icon="📝",
     layout="wide"
 )
+
+class Config:
+    """LinkToNote設定クラス"""
+    REQUEST_TIMEOUT = 10
+    USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+    DEFAULT_TAGS = ['webclip', 'linktonote']
+    MAX_TITLE_LENGTH = 50
+    MAX_DESCRIPTION_LENGTH = 200
+    MAX_FILENAME_LENGTH = 30
 
 def is_valid_url(url):
     """URLの妥当性をチェック"""
@@ -34,9 +39,7 @@ def clean_text(text, max_length=None):
     if not text:
         return ""
     
-    # HTMLエンティティをデコード
     text = text.strip()
-    # 改行や余分な空白を除去
     text = re.sub(r'\s+', ' ', text)
     
     if max_length and len(text) > max_length:
@@ -44,8 +47,26 @@ def clean_text(text, max_length=None):
     
     return text
 
+def safe_get_content(element):
+    """BeautifulSoup要素から安全にcontentを取得"""
+    if element is None:
+        return None
+    try:
+        return element.get('content', '')
+    except:
+        return None
+
+def safe_get_text(element):
+    """BeautifulSoup要素から安全にテキストを取得"""
+    if element is None:
+        return None
+    try:
+        return element.get_text()
+    except:
+        return str(element) if element else None
+
 def get_preview_robust(url, timeout=None):
-    """堅牢なプレビュー取得関数（同期版）"""
+    """堅牢なプレビュー取得関数"""
     if timeout is None:
         timeout = Config.REQUEST_TIMEOUT
     
@@ -56,46 +77,53 @@ def get_preview_robust(url, timeout=None):
         
         soup = BeautifulSoup(response.content, 'html.parser')
         
-        # より堅牢なタイトル取得
+        # タイトル取得の優先順位
         title = url  # デフォルト値
         
-        # OGタイトルを試行
+        # OGタイトル
         og_title = soup.find('meta', property='og:title')
-        if og_title and og_title.get('content'):
-            title = og_title.get('content')
+        og_title_content = safe_get_content(og_title)
+        if og_title_content:
+            title = og_title_content
         else:
-            # Twitterタイトルを試行
+            # Twitterタイトル
             twitter_title = soup.find('meta', {'name': 'twitter:title'})
-            if twitter_title and twitter_title.get('content'):
-                title = twitter_title.get('content')
+            twitter_title_content = safe_get_content(twitter_title)
+            if twitter_title_content:
+                title = twitter_title_content
             else:
-                # 通常のタイトルタグを試行
+                # 通常のタイトルタグ
                 title_tag = soup.find('title')
-                if title_tag and title_tag.text:
-                    title = title_tag.text
+                title_text = safe_get_text(title_tag)
+                if title_text:
+                    title = title_text
                 else:
-                    # H1タグを試行
+                    # H1タグ
                     h1_tag = soup.find('h1')
-                    if h1_tag and h1_tag.text:
-                        title = h1_tag.text
+                    h1_text = safe_get_text(h1_tag)
+                    if h1_text:
+                        title = h1_text
         
-        # より堅牢な説明取得
+        # 説明取得の優先順位
         description = "説明なし"  # デフォルト値
         
-        # OG説明を試行
+        # OG説明
         og_desc = soup.find('meta', property='og:description')
-        if og_desc and og_desc.get('content'):
-            description = og_desc.get('content')
+        og_desc_content = safe_get_content(og_desc)
+        if og_desc_content:
+            description = og_desc_content
         else:
-            # 通常のdescriptionを試行
+            # 通常のdescription
             desc_meta = soup.find('meta', {'name': 'description'})
-            if desc_meta and desc_meta.get('content'):
-                description = desc_meta.get('content')
+            desc_content = safe_get_content(desc_meta)
+            if desc_content:
+                description = desc_content
             else:
-                # Twitterの説明を試行
+                # Twitter説明
                 twitter_desc = soup.find('meta', {'name': 'twitter:description'})
-                if twitter_desc and twitter_desc.get('content'):
-                    description = twitter_desc.get('content')
+                twitter_desc_content = safe_get_content(twitter_desc)
+                if twitter_desc_content:
+                    description = twitter_desc_content
         
         # テキストをクリーンアップ
         title = clean_text(title, Config.MAX_TITLE_LENGTH)
@@ -107,93 +135,14 @@ def get_preview_robust(url, timeout=None):
         error_msg = f"取得エラー: {str(e)[:50]}"
         return url, error_msg
 
-async def get_preview_async(session, url):
-    """非同期でプレビュー情報を取得"""
-    try:
-        timeout = aiohttp.ClientTimeout(total=Config.REQUEST_TIMEOUT)
-        headers = {'User-Agent': Config.USER_AGENT}
-        
-        async with session.get(url, timeout=timeout, headers=headers) as response:
-            if response.status != 200:
-                return url, f"HTTPエラー: {response.status}"
-            
-            html = await response.text()
-            
-            # BeautifulSoupでの処理は同期的に実行
-            loop = asyncio.get_event_loop()
-            return await loop.run_in_executor(None, parse_html, html, url)
-            
-    except asyncio.TimeoutError:
-        return url, "タイムアウトエラー"
-    except Exception as e:
-        return url, f"取得エラー: {str(e)[:50]}"
-
-def parse_html(html, url):
-    """HTMLを解析してタイトルと説明を取得"""
-    try:
-        soup = BeautifulSoup(html, 'html.parser')
-        
-        # タイトル取得
-        title_elem = (
-            soup.find('meta', property='og:title') or
-            soup.find('meta', {'name': 'twitter:title'}) or
-            soup.find('title') or
-            soup.find('h1')
-        )
-        
-        if title_elem:
-            if title_elem.has_attr('content'):
-                title = title_elem.get('content', '')
-            else:
-                title = title_elem.get_text()
-        else:
-            title = url
-        
-        # 説明取得
-        desc_elem = (
-            soup.find('meta', property='og:description') or
-            soup.find('meta', {'name': 'description'}) or
-            soup.find('meta', {'name': 'twitter:description'})
-        )
-        
-        description = desc_elem.get('content', '') if desc_elem else "説明なし"
-        
-        # テキストをクリーンアップ
-        title = clean_text(title, Config.MAX_TITLE_LENGTH)
-        description = clean_text(description, Config.MAX_DESCRIPTION_LENGTH)
-        
-        return title, description
-        
-    except Exception as e:
-        return url, f"解析エラー: {str(e)[:50]}"
-
-async def process_urls_async(urls, max_concurrent=None):
-    """非同期でURLリストを処理"""
-    if max_concurrent is None:
-        max_concurrent = Config.MAX_CONCURRENT_REQUESTS
-    
-    connector = aiohttp.TCPConnector(limit=max_concurrent)
-    async with aiohttp.ClientSession(connector=connector) as session:
-        semaphore = asyncio.Semaphore(max_concurrent)
-        
-        async def bounded_fetch(url):
-            async with semaphore:
-                return await get_preview_async(session, url)
-        
-        tasks = [bounded_fetch(url) for url in urls]
-        return await asyncio.gather(*tasks)
-
 def generate_obsidian_filename(title, url):
     """Obsidian用のファイル名を生成"""
-    # 日付プレフィックス追加
     date_prefix = datetime.now().strftime("%Y%m%d-")
     
-    # タイトルのクリーンアップ
     clean_title = re.sub(r'[\\/*?:"<>|]', "", title)
     clean_title = re.sub(r'\s+', '-', clean_title)
     clean_title = clean_title[:Config.MAX_FILENAME_LENGTH]
     
-    # ドメイン情報を追加
     try:
         domain = urlparse(url).netloc.replace('www.', '')
         domain = re.sub(r'[\\/*?:"<>|]', "", domain)
@@ -245,13 +194,12 @@ def process_links_with_progress(urls):
         results.append(result)
         progress_bar.progress((i + 1) / len(urls))
         
-        # 短い待機時間を追加（レート制限対策）
+        # レート制限対策
         time.sleep(0.1)
     
-    status_text.text('完了!')
+    status_text.text('✅ 完了!')
     return results
 
-# メインアプリケーション
 def main():
     st.title("📝 LinkToNote for Obsidian")
     st.markdown("大量のWebリンクをObsidian用Markdownに一括変換")
@@ -268,21 +216,14 @@ def main():
         # フロントマター設定
         include_frontmatter = st.checkbox("フロントマター追加", True)
         
-        # 並行処理数設定
-        max_concurrent = st.slider("同時処理数", 1, 10, Config.MAX_CONCURRENT_REQUESTS)
-        
-        # 処理方式選択
-        use_async = st.checkbox("高速処理モード（非同期）", True)
-        
         st.markdown("---")
-        st.markdown("**ヒント**")
-        st.markdown("- 大量のリンク処理には高速処理モードを推奨")
-        st.markdown("- 同時処理数を上げすぎるとエラーが発生する場合があります")
+        st.markdown("**💡 ヒント**")
+        st.markdown("- 生成されたファイルをObsidianのvaultフォルダにコピーしてください")
+        st.markdown("- フロントマターはObsidianのプロパティとして認識されます")
     
     # メイン処理エリア
     st.header("📋 リンク入力")
     
-    # より大きなテキストエリア
     urls_input = st.text_area(
         "リンクを改行で複数入力してください",
         height=200,
@@ -327,29 +268,8 @@ def main():
             if st.button("🚀 一括処理開始", type="primary"):
                 start_time = time.time()
                 
-                # 非同期処理 vs 同期処理
-                if use_async and len(urls) > 1:
-                    st.info("🚀 高速処理モードで実行中...")
-                    
-                    # 非同期処理の実行
-                    with st.spinner(f"{len(urls)}個のリンクを非同期処理中..."):
-                        try:
-                            # イベントループの作成と実行
-                            if hasattr(asyncio, 'run'):
-                                results = asyncio.run(process_urls_async(urls, max_concurrent))
-                            else:
-                                # Python 3.6 対応
-                                loop = asyncio.new_event_loop()
-                                asyncio.set_event_loop(loop)
-                                results = loop.run_until_complete(process_urls_async(urls, max_concurrent))
-                                loop.close()
-                        except Exception as e:
-                            st.error(f"非同期処理エラー: {e}")
-                            st.info("同期処理モードにフォールバック...")
-                            results = process_links_with_progress(urls)
-                else:
-                    st.info("📝 標準処理モードで実行中...")
-                    results = process_links_with_progress(urls)
+                st.info("📝 リンク情報を取得中...")
+                results = process_links_with_progress(urls)
                 
                 processing_time = time.time() - start_time
                 
@@ -359,10 +279,8 @@ def main():
                 
                 # ファイル生成と表示
                 file_paths = []
-                markdown_contents = []
                 
                 for i, (url, (title, description)) in enumerate(zip(urls, results)):
-                    # 個別タグ設定（必要に応じて）
                     link_tags = tags.copy()
                     
                     # エキスパンダーでコンパクト表示
@@ -396,7 +314,6 @@ def main():
                     markdown_content = generate_obsidian_markdown(
                         title, url, description, note, link_tags, include_frontmatter
                     )
-                    markdown_contents.append(markdown_content)
                     
                     # ファイル保存
                     filename = generate_obsidian_filename(title, url)
